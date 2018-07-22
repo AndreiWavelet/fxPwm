@@ -100,9 +100,9 @@ Also note that very high frequencies (>1000 hz) (or many ports enabled at once) 
 Sets the duty cycle of the PWM cycle. By default, this value goes from 0.0 (at 0% duty cycle) to 1.0 (at 100% duty cycle).
 If fxPwm.SepMap() had been called before fxPwm.SetDuty, the duty cycle will be mapped to a different function.
 
-### fxPwm.SepMap(pinNumber, duty1, value1, duty2, value2);
+### fxPwm.SetMap(pinNumber, duty1, value1, duty2, value2);
 
-Maps the duty cycle so that the range duty1~duty2 becomes value~value2.
+Maps the duty cycle so that the range duty1 ~ duty2 becomes value ~ value2.
 This is useful if your controlled variable is not in the range 0.0 ~ 1.0.
 
 ### fxPwm.EnablePin(pinNumber); fxPwm.DisablePin(pinNumber);
