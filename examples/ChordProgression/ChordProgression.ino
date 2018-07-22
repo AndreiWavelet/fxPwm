@@ -3,9 +3,18 @@
  * Plays a chord progression using 4 PWM ports.
  * The chord progression is: Cm Fm Cm G G/7 Cm
  * 
- * You must connect a buzzer into each port (2,3,4,5) for this to work;
+ * To test this example you must build one of the following circuits:
+ *
+ * The easiest way is to connect a buzzer into each used pin. (2, 3, 4 and 5).
+ * 
+ * If you have a small speaker, you can connect a 220 ohm resistor into each port.
+ * Then you connect the other side of the resistors together at a breadboard.
+ * Connect a capacitor (10 uF?) in series with the resistors, and the other side of the cap to the speaker.
+ * The other side of the speaker go to ground.
+ * 
  * 
  * Andrei Alves Cardoso, 18/07/2018
+ * Updated 22/07/2018
  *
  */
 
@@ -24,60 +33,58 @@
 
 void setup() {
   //Initialize fxPwm library with four output.
-  fxPwm_Initialize(4,NULL);
+  fxPwm.Initialize();
+  fxPwm.Start();
 
   //Configures the ports to pins 2, 3, 4 and 5.
-  fxPwm_ConfigurePort(0, 2);
-  fxPwm_ConfigurePort(1, 3);
-  fxPwm_ConfigurePort(2, 4);
-  fxPwm_ConfigurePort(3, 5);
-
-  //Starts the library.
-  fxPwm_Start();
+  fxPwm.RegisterPort(2);
+  fxPwm.RegisterPort(3);
+  fxPwm.RegisterPort(4);
+  fxPwm.RegisterPort(5);
 }
 
 void loop() {
   //500 ms silent
-  fxPwm_DisableAll();
+  fxPwm.DisableAll();
   delay(500);
-  fxPwm_EnableAll();
+  fxPwm.EnableAll();
 
   //C minor
-  fxPwm_SetFrequency(0, FREQUENCY_C4);
-  fxPwm_SetFrequency(1, FREQUENCY_Ds4);
-  fxPwm_SetFrequency(2, FREQUENCY_G4);
+  fxPwm.SetFrequency(2, FREQUENCY_C4);
+  fxPwm.SetFrequency(3, FREQUENCY_Ds4);
+  fxPwm.SetFrequency(4, FREQUENCY_G4);
   delay(1000);
 
   //F minor
-  fxPwm_SetFrequency(0, FREQUENCY_C4);
-  fxPwm_SetFrequency(1, FREQUENCY_F4);
-  fxPwm_SetFrequency(2, FREQUENCY_Gs4);
+  fxPwm.SetFrequency(2, FREQUENCY_C4);
+  fxPwm.SetFrequency(3, FREQUENCY_F4);
+  fxPwm.SetFrequency(4, FREQUENCY_Gs4);
   delay(1000);
 
   //C minor
-  fxPwm_SetFrequency(0, FREQUENCY_C4);
-  fxPwm_SetFrequency(1, FREQUENCY_Ds4);
-  fxPwm_SetFrequency(2, FREQUENCY_G4);
+  fxPwm.SetFrequency(2, FREQUENCY_C4);
+  fxPwm.SetFrequency(3, FREQUENCY_Ds4);
+  fxPwm.SetFrequency(4, FREQUENCY_G4);
   delay(1000);
 
   //G
-  fxPwm_SetFrequency(0, FREQUENCY_B3);
-  fxPwm_SetFrequency(1, FREQUENCY_D4);
-  fxPwm_SetFrequency(2, FREQUENCY_G4);
+  fxPwm.SetFrequency(2, FREQUENCY_B3);
+  fxPwm.SetFrequency(3, FREQUENCY_D4);
+  fxPwm.SetFrequency(4, FREQUENCY_G4);
   delay(1000);
 
   //G/7
-  fxPwm_SetFrequency(0, FREQUENCY_B3);
-  fxPwm_SetFrequency(1, FREQUENCY_D4);
-  fxPwm_SetFrequency(2, FREQUENCY_F4);
-  fxPwm_SetFrequency(3, FREQUENCY_G4);
+  fxPwm.SetFrequency(2, FREQUENCY_B3);
+  fxPwm.SetFrequency(3, FREQUENCY_D4);
+  fxPwm.SetFrequency(4, FREQUENCY_F4);
+  fxPwm.SetFrequency(5, FREQUENCY_G4);
   delay(1000);
 
   //C minor
-  fxPwm_SetFrequency(0, FREQUENCY_C4);
-  fxPwm_SetFrequency(1, FREQUENCY_Ds4);
-  fxPwm_SetFrequency(2, FREQUENCY_G4);
-  fxPwm_SetFrequency(3, 0.0);
+  fxPwm.SetFrequency(2, FREQUENCY_C4);
+  fxPwm.SetFrequency(3, FREQUENCY_Ds4);
+  fxPwm.SetFrequency(4, FREQUENCY_G4);
+  fxPwm.SetFrequency(5, 0.0);
   delay(1500);
   
 }

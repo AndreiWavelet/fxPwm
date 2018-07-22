@@ -9,498 +9,753 @@
  *  porém NÃO HÁ GARANTIA para qualquer propósito.
  *  -----------------------------------------------------------
  *  17-07-2018: primeira documentação
+ *  21-07-2018: modificações maiores na estrutura da biblioteca. Melhoria de desempenho.
  */
 
-#include "arduino.h"
-#include <stdlib.h>
 #include <fxPwmTypes.h>
-
 #include <fxPwm.h>
-#include <t1custom.h>
+#include <fxPwm_Port.h>
+#include <stdlib.h>
+#include <avr/interrupt.h>
+#include "arduino.h"
 
 
-//Macros para salvar o contexto do SREG. Muito importante aqui.
-#define fxPwm_SAVE_SREG() BYTE sreg = SREG
-#define fxPwm_RESTORE_SREG() SREG=sreg
+#ifndef fxPwm_SaveSREG
+#define fxPwm_SaveSREG() BYTE sreg_saved = SREG
+#endif
 
-//Indicador de que não há próximo evento (porta desabilitada).
-#define fxPwm_NO_NEXT_EVENT TIME_US_MAX
+#ifndef fxPwm_RestoreSREG
+#define fxPwm_RestoreSREG() SREG = sreg_saved
+#endif
 
-//Estrutura que encapsula dados correntes a respeito de um modulador PWM.
-typedef struct{
-  //Indica se o canal está ou não habilitado.
-  BOOL enabled;
+#define fxPwm_CLEAR_BITS(value,mask)    (value&(~mask)) 
+#define fxPwm_SET_BITS(value,mask)      (value|mask)
+#define fxPwm_INVERT_BITS(value, mask)  (value^mask)
+
+//Instância.
+fxPwm_T1 fxPwm;
+
+UINT32  fxPwm_T1::nsPerTimerClock   = 1; //Cuidado com divisão por zero
+UINT16  fxPwm_T1::minTimerGap       = 0;
+UINT16  fxPwm_T1::minTimerDelta     = 0;
+UINT16  fxPwm_T1::maxTimerDuration  = 0;
+UINT16  fxPwm_T1::maxTimerPeriod    = 0;
+UINT8   fxPwm_T1::prescaler         = 0;
+
+//===============================================================
+//Métodos internos.
+//===============================================================
+
+//Interrupt
+ISR(TIMER1_COMPB_vect , ISR_NOBLOCK){
+  fxPwm.Tick();
+}
+
+//Limpa todos itens e pré-calcula alguns valores específicos.
+void fxPwm_T1::Cleanup(){
+  this->maxPorts = 0;
+  this->ports = NULL;
+  this->allocatedPins = NULL;
+
+  this->lastClock = 0;
+  this->clockCount = 0;
   
-  //Ponteiro para o registrador que contém o estado da porta.
-  volatile BYTE *port;
-  //Ponteiro para o registrador que contém a direção da porta.
-  volatile BYTE *DDR;
-  //Máscara, para alterar os registradores de direção e estado.
-  volatile BYTE mask;
-
-  //Período e ciclo de trabalho atual.
-  TIME_US period;
-  FLOAT duty;
+  //Escolher pré-escalar de acordo com a frequência de clock,
+  //de modo que o período do timer seja o menor valor possível maior que 1 us.
+  if(((UINT32)1000000000)/(F_CPU)>=fxPwm_MinTimerResolution){
+    //Precisa usar a resolução máxima.
+    prescaler = 0b001;
+    nsPerTimerClock = 1000000000/F_CPU;
+  }else if(((UINT32)1000000000)/(F_CPU>>3)>=fxPwm_MinTimerResolution){
+    //Escolher pré-escalar anterior.
+    //Pré-escalar: clk/1
+    prescaler = 0b001;
+    nsPerTimerClock = 1000000000/F_CPU;
+  }else if(((UINT32)1000000000)/(F_CPU>>6)>=fxPwm_MinTimerResolution){
+    //Escolher pré-escalar anterior.
+    //Pré-escalar: clk/8
+    prescaler = 0b010;
+    nsPerTimerClock = 1000000000/(F_CPU>>3);
+  }else if(((UINT32)1000000000)/(F_CPU>>8)>=fxPwm_MinTimerResolution){
+    //Escolher pré-escalar anterior.
+    //Pré-escalar: clk/64
+    prescaler = 0b011;
+    nsPerTimerClock = 1000000000/(F_CPU>>6);
+  }else if(((UINT32)1000000000)/(F_CPU>>10)>=fxPwm_MinTimerResolution){
+    //Escolher pré-escalar anterior.
+    //Pré-escalar: clk/256
+    prescaler = 0b100;
+    nsPerTimerClock = 1000000000/(F_CPU>>8);
+  }else{
+    //Escolher pré-escalar máximo.
+    //Pré-escalar: clk/1024
+    prescaler = 0b101;
+    nsPerTimerClock = 1000000000/(F_CPU>>10);
   
-  //Observe que halfPeriod1 + halfPeriod2 = period.
+  }
+
+  //Calcular parâmetros.
+  //As constantes estão em microssegundos.
+  //Converter para ciclos de clock do timer.
   
-  //Primeira metade do período. No primeiro ciclo, representa o tempo em nível ALTO. Fica alternando com halfPeriod2.
-  volatile TIME_US halfPeriod1;
-  //Segunda metade do período. No primeiro ciclo, representa o tempo em nível BAIXO. Fica alternando com halfPeriod1.
-  volatile TIME_US halfPeriod2;
-  //Momento do próximo evento de troca de nível em relação ao início do mundo, em microssegundos.
-  //Se nextEvent=fxPwm_NO_NEXT_EVENT, significa que o canal está silenciado, mas não necessariamente desabilitado.
-  volatile TIME_US nextEvent;
-}fxPwm_PortData;
+  TIME_CLOCK temp = (TIME_CLOCK)(((UINT64)fxPwm_MinTimerGap*1000)/nsPerTimerClock);
+  minTimerGap = (UINT16)((temp>fxPwm_MaxTimerClkSum)?(fxPwm_MaxTimerClkSum):(temp));
 
-//Portas PWM registradas.
-fxPwm_PortData *fxPwm_ports = NULL;
-volatile UINT8 fxPwm_numPorts = 0;
+  temp = (TIME_CLOCK)((UINT64)fxPwm_MaxTimerDuration*1000)/nsPerTimerClock;
+  maxTimerDuration = (UINT16)((temp>fxPwm_MaxTimerClkSum)?(fxPwm_MaxTimerClkSum):(temp));
 
-//Garantia de haver começado.
-volatile BOOL fxPwm_started = FALSE;
+  temp = (TIME_CLOCK)((UINT64)fxPwm_MaxTimerPeriod*1000)/nsPerTimerClock;
+  maxTimerPeriod = (UINT16)((temp>fxPwm_MaxTimerClkSum)?(fxPwm_MaxTimerClkSum):(temp));
 
-//Função micros.
-TIME_US (*fxPwm_MicrosCallback)() = t1c_Micros;
+  temp = (TIME_CLOCK)((UINT64)fxPwm_MinTimerDelta*1000)/nsPerTimerClock;
+  minTimerDelta = (UINT16)((temp>fxPwm_MaxTimerClkSum)?(fxPwm_MaxTimerClkSum):(temp));
 
-/* Callback que efetivamente modula o PWM.
- * 
- * Note que essa função é muito apertada em termos de tempo, e tudo tem que ser feito de forma mais rápida possível.
- * Eu poderia implementar isso em assembly, mas prefiro manter a didaticidade do código.
- * 
- * Para que as coisas sejam rápidas, a função não faz verificações de robustez.
- * Ela assume que tudo está íntegro. Portanto, a integridade deve ser garantida pelas funções que manipulam o que aqui é usado.
- *  
- */
-void fxPwm_Callback(){
-  TIME_US currentTime = fxPwm_MicrosCallback();
-  TIME_US nextEvent, aux;
-  fxPwm_PortData *currentPort, *last;
+  return;
+}
 
-  //Calcular deadline, isto é, até quando essa função pode ficar executando sem penalidade.
-  TIME_US deadline = currentTime+fxPwm_MAX_TIMER_CALLBACK_DURATION;
-  //Calcular próximo evento no pior caso. Internamente, essa valor vai ser mudado.
-  nextEvent = currentTime + fxPwm_MIN_TIMER_PERIOD;
+//Configura o timer escrevendo em seus registros.
+//Também calcula pré-escalar adequado e resolução.
+void fxPwm_T1::ConfigureTimer(){
+  fxPwm_SaveSREG();cli();
 
-  last = &fxPwm_ports[fxPwm_numPorts+1];
+  //Escrever todos registros.
 
+  //TCCR1A:
+  //Não mexer com OC1A e OC1B:  0b0000xxxx
+  //Modo normal:                0bxxxxxx00
+  TCCR1A = fxPwm_CLEAR_BITS(TCCR1A, 0b11110011);
+
+  //TCCR1B:
+  //Sem cancelamento de ruído:  0b0xxxxxxx
+  //Sem detecção de borda:      0bx0xxxxxx
+  //Modo normal:                0bxxx00xxx
+  //Clock desligado:            0bxxxxx000
+  TCCR1B = fxPwm_CLEAR_BITS(TCCR1B, 0b11011111);
+
+  //TCCR1C:
+  TCCR1B = fxPwm_CLEAR_BITS(TCCR1B, 0b11000000);
+
+  //TCNT1: contagem atual
+  TCNT1 = 1;
+
+  //ICR1: não usado.
+  ICR1 = 0;
+
+  //OCR1A: comparado constantemente com TCNT1 para disparar interrupção.
+  OCR1A = 0;
+
+  //OCR1B: o mesmo que OCR1A. Não usado.
+  OCR1B = 0;
+
+  //TIMSK1: 
+  //Habilitar OCIEA:  0bxxxxxx1x (interrupção quando OCR1A=TCNT1)
+  //Limpar ICIE, OCIEB E TOIE: 0bxx0xx0x0
+  TIMSK1 = fxPwm_CLEAR_BITS(TIMSK1, 0b00100111);
+  TIMSK1 = fxPwm_SET_BITS(TIMSK1, 0b00000100);
+
+  //TIFR1: flags de interrupção. Limpar todas: 0bxx0xx000
+  TIFR1 = fxPwm_CLEAR_BITS(TIMSK1, 0b00100111);
+  
+  //Timer configurado.
+  fxPwm_RestoreSREG();
+  
+  return;
+}
+
+//Inicia o temporizador escrevendo os bits do pré-escalar no TCCR1B.
+void fxPwm_T1::StartTimer(){
+  fxPwm_SaveSREG();cli();
+  
+  //Escrever em TCCR1B os bits do pré-escalar calculado.
+  TCCR1B = fxPwm_CLEAR_BITS(TCCR1B, 0b00000111);
+  TCCR1B = fxPwm_SET_BITS(TCCR1B, fxPwm_CLEAR_BITS(prescaler, 0b11111000));
+
+  fxPwm_RestoreSREG();
+
+  return;
+}
+
+//Para o temporizador limpando os bits do pré-escalar no TCCR1B.
+void fxPwm_T1::StopTimer(){
+  fxPwm_SaveSREG();cli();
+  
+  //Escrever em TCCR1B bits 0 no pré-escalar.
+  TCCR1B = fxPwm_CLEAR_BITS(TCCR1B, 0b00000111);
+
+  fxPwm_RestoreSREG();
+
+  return;
+}
+
+//Agenda a próxima chamada do callback do temporizaodr.
+//Se clockCount estiver mais longe que a próxima chamada, a próxima chamada continua agendada.
+//Se clockCount vier primeiro, clockCount é agendado.
+void fxPwm_T1::SetNextFireMin(TIME_CLOCK clockCount){
+  fxPwm_SaveSREG();cli();
+  if(clockCount<=this->clockCount){
+    //Muito em cima da hora.
+    OCR1B = TCNT1 + 1;
+  }else{
+    //Calcular diferença atual e a próxima e decidir pela menor.
+    TIME_CLOCK currentDif = (OCR1B==TCNT1)?(65536):((TIME_CLOCK)(OCR1B - TCNT1));
+    TIME_CLOCK newDif = clockCount - this->clockCount;
+    if(newDif<currentDif){
+      OCR1B = TCNT1 + (UINT16)((newDif==0)?(1):(newDif));
+    }
+  }
+  fxPwm_RestoreSREG();
+
+  return;
+}
+
+//Limpar na instância.
+fxPwm_T1::fxPwm_T1(){
+  Cleanup();
+
+  return;
+}
+
+BOOL fxPwm_T1::IsAllocated(){
+  return (this->maxPorts>0 && this->ports!=NULL && this->allocatedPins)?(TRUE):(FALSE);
+}
+
+//===============================================================
+//Um método muito importante.
+//===============================================================
+
+//Realiza o processamento da modulação PWM.
+//Essa função precisa executar tão rápida quanto possível.
+void fxPwm_T1::Tick(){
+  //Adquirir rapidamente condições inicais.
+  UINT16 lastTCNT1 = TCNT1;
+  this->clockCount += (TIME_CLOCK)(lastTCNT1 - lastClock);
+  this->lastClock = lastTCNT1;
+
+  //Deadline de execução dessa função. Para evitar que se perca eternamente aqui.
+  TIME_CLOCK deadline = this->clockCount + maxTimerDuration;
+  //Próximo evento previsto.
+  TIME_CLOCK next;
+
+  //Alguns ponteiros.
+  fxPwm_Port* currentPort;
+  fxPwm_Port** portIndex;
+  
   do{
-    currentTime = fxPwm_MicrosCallback();
-    currentPort = fxPwm_ports;
+    //Adquirir novos valores de tempo.
+    lastTCNT1 = TCNT1;
+    this->clockCount += (TIME_CLOCK)(lastTCNT1 - lastClock);
+    this->lastClock = lastTCNT1;
+    next=this->clockCount+maxTimerPeriod;
+    //Restaura ponteiro para início da lista de portas.
+    portIndex = ports;
 
-    //Laço que vai percorrer as portas.
-    do{
-      if(currentTime>=currentPort->nextEvent){
-        *currentPort->port ^= currentPort->mask;
-
-        //Calcular o próximo evento.
-        currentPort->nextEvent += currentPort->halfPeriod1;
-
-        //Permutar os valores de halfPeriod1 e halfPeriod2.
-        //É possível usar XOR para fazer isso, se quiser.
-        //Prefiro o método convencional, entretanto.
-        aux = currentPort->halfPeriod1;
-        currentPort->halfPeriod1 = currentPort->halfPeriod2;
-        currentPort->halfPeriod2 = aux;
+    //Percorre a lista de portas e processa eventos agendados em cada uma.
+    //Para quando encontrar um elemento NULL na lista.
+    while((currentPort = *portIndex++)!=NULL){
+      if(currentPort->enabled==FALSE){
+        //Pula elemento se não estiver habilitado.
+        continue;
       }
-      //Selecionar o evento mais próximo enquanto percorre.
-      if(currentPort->nextEvent<nextEvent){
-        nextEvent = currentPort->nextEvent;
+      //Verifica se está na hora do próximo evento.
+      if(this->clockCount>=currentPort->next){
+        //Verifica se está em nível ALTO (para trocar para BAIXO), e se o período BAIXO é >0.
+        if(currentPort->outHint && currentPort->lowPeriod>0){
+          //Está em nível ALTO. Trocar para nível BAIXO.
+          *currentPort->port &= ~currentPort->mask;
+          //Calcular próxima chamada.
+          currentPort->next+=currentPort->lowPeriod;
+          currentPort->outHint = 0x00;
+        }else if(currentPort->highPeriod>0){
+          //Está em nível BAIXO. Trocar para ALTO, se o período ALTO é >0.
+          *currentPort->port |= currentPort->mask;
+          currentPort->next+=currentPort->highPeriod;
+          currentPort->outHint = 0xFF;
+        }
+        //A motivação dessa estrutura é permitir ciclos de trabalhos 0% verdadeiro e 100% verdadeiro.
       }
-      currentPort++;
-    }while(currentPort<last);
-  }while(currentTime>nextEvent-fxPwm_TIMER_CALLBACK_SAFE_OVERHEAD && currentTime<deadline);
+      //Obtém próximo evento.
+      next = (currentPort->next<next)?(currentPort->next):(next);
+    }
 
-  t1c_SetNextFire(nextEvent);
+    //Sai do laço em duas condições:
+    //Se a fenda até o próximo evento por grande o suficiente OU
+    //Se der o deadline.
+  }while(clockCount>next-minTimerGap && clockCount<deadline);
+
+  //Agendar próxima chamada.
+
+  //Calcular tempo pela última vez.
+  lastTCNT1 = TCNT1;
+  this->clockCount += (TIME_CLOCK)(lastTCNT1 - lastClock);
+  this->lastClock = lastTCNT1;
+
+  //Garantir que a próxima chamada ocorra não antes que minTimerDelta do tempo atual.
+  //Se isso não for feito, coisas estranhas acontecem... (estouro de pilha?)
+  if(next<this->clockCount+minTimerDelta){
+    OCR1B = lastTCNT1 + minTimerDelta;
+  }else{
+    OCR1B = lastTCNT1 + (next - this->clockCount);
+  }
+
+  return;
 }
 
-// Limpa toda a memória referente a uma porta, e inicializa valores padrões.
-void fxPwm_ClearPort(UINT8 port){
-  //Garantir robustez.
-  if(port>=fxPwm_numPorts || fxPwm_ports==NULL){
+//===============================================================
+//Métodos de inicialização e liberação.
+//===============================================================
+
+//Inicializa usando a definição de fxPwm_MaxPorts.
+void fxPwm_T1::Initialize(){
+  this->Initialize(fxPwm_MaxPorts);
+
+  return;
+}
+
+//Inicializa a classe definindo um número máximo de portas alocáveis.
+void fxPwm_T1::Initialize(UINT8 maxPorts){
+  fxPwm_SaveSREG();cli();
+
+  //Verificar se existe algo de antes.
+  //Se tiver, limpar.
+  if(this->IsAllocated()!=FALSE){
+    this->Free();
+  }else{
+    //Realizar limpeza preventiva de qualquer jeito.
+    Cleanup();
+  }
+
+  //Tentar alocar lista de portas.
+  ports = (fxPwm_Port**)malloc(sizeof(fxPwm_Port*)*(maxPorts+1));
+  if(ports==NULL){
+    //Falhou.
+    fxPwm_RestoreSREG();
     return;
   }
 
-  fxPwm_PortData *current = &fxPwm_ports[port];
+  //Tentar alocar lista de pinos.
+  allocatedPins = (UINT8*)malloc(sizeof(UINT8)*(maxPorts));
+  if(allocatedPins==NULL){
+    free(ports);
+    fxPwm_RestoreSREG();
+    return;
+  }
 
-  fxPwm_SAVE_SREG();
-  cli();
+  //Salvar máximo de portas.
+  this->maxPorts = maxPorts;
 
-  current->enabled = FALSE;
+  //Passar limpando tudo.
+  UINT8 t;
+  for(t=0;t<this->maxPorts+1;t++){
+    ports[t] = NULL;
+    if(t<this->maxPorts){
+      //Evitar que o último elemento seja limpo.
+      allocatedPins[t] = 0xFF;
+    }
+  }
 
-  current->port = NULL;
-  current->DDR = NULL;
-  current->mask = 0;
+  //Configurar o timer.
+  this->ConfigureTimer();
 
-  current->period = (TIME_US)0;
-  current->duty = fxPwm_START_DUTY;
+  //Restaurar SREG e terminar.
+  fxPwm_RestoreSREG();
   
-  current->halfPeriod1 = (TIME_US)0;
-  current->halfPeriod2 = (TIME_US)0;
-
-  current->nextEvent = (TIME_US)fxPwm_NO_NEXT_EVENT;
-
-  fxPwm_RESTORE_SREG();
+  return;
 }
 
-void fxPwm_ClearAllPorts(){
+//Libera todos recursos.
+void fxPwm_T1::Free(){
+  if(this->IsAllocated()==FALSE){
+    //Não há portas alocadas. Apenas fazer uma limpeza.
+    Cleanup();
+    return;
+  }
+
+  fxPwm_SaveSREG();cli();
+
+  //Liberar todas portas.
+  UINT8 t;
+  for(t=0;t<this->maxPorts==0;t++){
+    this->RemovePort(this->ports[0]);
+  }
+
+  //Liberar memórias.
+  free(ports);
+  free(allocatedPins);
+
+  //Limpeza.
+  Cleanup();
+
+  fxPwm_RestoreSREG();
+  return;
+}
+
+//Inicia o TIMER1 e recalcula a fase de todos osciladores.
+void fxPwm_T1::Start(){
+  //Verifica realidade.
+  if(this->IsAllocated()==FALSE){
+    return;
+  }
+  
+  fxPwm_SaveSREG();cli();
+  
+  this->StartTimer();
+  
+  UINT8 t;
+  for(t=0;t<this->maxPorts;t++){
+    ports[t]->ResetPhase();
+  }
+
+  fxPwm_RestoreSREG();
+
+  return;
+}
+
+//Para o TIMER1.
+void fxPwm_T1::Stop(){
+  this->StopTimer();
+}
+
+//===============================================================
+//Funções de manipulação de portas e pinos.
+//===============================================================
+
+//Registra uma porta, colocando seu ponteiro no fim de uma lista estática.
+void fxPwm_T1::RegisterPort(fxPwm_Port *port){
+  //Verifica realidade.
+  if(this->IsAllocated()==FALSE || port==NULL){
+    return;
+  }
+
   UINT8 t;
 
-  for(t=0;t<UINT8_MAX;t++){
-    fxPwm_ClearPort(t);
+  //Verificar se o pino já está registrado. Recusar se estiver.
+  for(t=0;t<this->maxPorts;t++){
+    if(this->ports[t]->pinNumber == port->pinNumber){
+      //Não aceitar alocar duas portas com mesmo valor de pino.
+      return;
+    }
+    if(this->ports[t]==NULL){
+      //Acabou a lista.
+      break;
+    }
+  }
+
+  //Verificar se chegou ao fim da lista. Se tiver chegado, recusar adição.
+  if(t!=this->maxPorts){
+    fxPwm_SaveSREG();cli();
+    this->ports[t] = port;
+    //Não precisa registrar o pino em allocatedPins, já que não há garantia que esse ponteiro foi alocado internamente.
+    fxPwm_RestoreSREG();
   }
 
   return;
 }
 
-void fxPwm_Initialize(UINT8 numPorts, TIME_US (*microsFunction)()){
-  if(numPorts==0){
-    //Equivale à liberação da biblioteca.
-    fxPwm_Free();
-    return;
-  }
 
-  fxPwm_SAVE_SREG();
-  cli();
-
-  fxPwm_started = FALSE;
-  
-  //Liberar memória caso haja algo de antes...
-  if(fxPwm_ports!=NULL && fxPwm_numPorts!=0){
-    fxPwm_Free();
-  }
-
-  fxPwm_ports = (fxPwm_PortData*)malloc(sizeof(fxPwm_PortData)*numPorts);
-
-  //Verificar se está ok e prosseguir.
-  if(fxPwm_ports==NULL){
-    //Não alocou.
-    fxPwm_numPorts = 0;
-    fxPwm_MicrosCallback = t1c_Micros;
+//Registra uma porta a partir de um número de pino.
+//Para isso, ela aloca um objeto fxPwm_Port.
+void fxPwm_T1::RegisterPort(UINT8 pin){
+  //Verifica realidade.
+  if(this->IsAllocated()==FALSE || pin==0xFF){
     return;
   }
   
-  fxPwm_numPorts = numPorts;
-
-  if(microsFunction!=NULL){
-    fxPwm_MicrosCallback = microsFunction;
-  }else{
-    fxPwm_MicrosCallback = t1c_Micros;
+  //Buscar se porta já foi registrada e recusar se tiver sido.
+  UINT8 t;
+  for(t=0;t<this->maxPorts;t++){
+    if(this->ports[t]==NULL){
+      break;
+    }
+    if(this->ports[t]->pinNumber==pin){
+      //Já foi registado.
+      return;
+    }
   }
 
-  //Inicializar temporizador.
-  t1c_Configure(fxPwm_Callback, fxPwm_MicrosCallback);
-
-  //Limpa todas memórias e inicializa com valores padrões.
-  fxPwm_ClearAllPorts();
-  
-  fxPwm_RESTORE_SREG();
-  
-  return;
-}
-
-//Simplesmente atribui os valores adequados na estrutura.
-void fxPwm_ConfigurePort(UINT8 port, volatile BYTE* portPointer, volatile BYTE* ddrPointer, BYTE mask){
-  if(port>=fxPwm_numPorts || fxPwm_ports==NULL || portPointer==NULL || ddrPointer==NULL){
+  //Verificar se porta é válida.
+  if(t==this->maxPorts || digitalPinToPort(pin)==NOT_A_PIN){
     return;
   }
 
-  fxPwm_PortData *current = &fxPwm_ports[port];
-
-  fxPwm_SAVE_SREG();
-  cli();
-
-  current->port = portPointer;
-  current->DDR = ddrPointer;
-  current->mask = mask;
-
-  fxPwm_DigitalWrite(port, LOW);
-
-  fxPwm_RESTORE_SREG();
-}
-
-//Configura a porta a partir de um número de pino.
-void fxPwm_ConfigurePort(UINT8 port, UINT8 pinNumber){
-  volatile UINT8 *portAddr;
-  volatile UINT8 *ddrAddr;
-  UINT8 mask, portN;
-
-  //Obtém o número da porta e verifica se é um pino válido.
-  portN = digitalPinToPort(pinNumber);
-  if(portN==NOT_A_PIN){
+  //Tentar alocar memória para a porta.
+  fxPwm_Port *newPort = (fxPwm_Port*)malloc(sizeof(fxPwm_Port));
+  if(newPort==NULL){
+    //Falha ao alocar.
     return;
   }
 
-  //Obtém endereços da porta e do ddr.
-  portAddr = portOutputRegister(portN);
-  ddrAddr = portModeRegister(portN);
-  mask = digitalPinToBitMask(pinNumber);
+  //Realizar limpeza da memória da porta e atribuir pino.
+  newPort->Cleanup();
+  newPort->SetPinNumber(pin);
 
-  //Configura normalmente.
-  fxPwm_ConfigurePort(port, portAddr, ddrAddr, mask);
+  //Registrar porta.
+  this->RegisterPort(newPort);
+
+  //Colocar número do pino na lista de alocados internamente.
+  for(t=0;t<this->maxPorts;t++){
+    if(this->allocatedPins[t]==0xFF){
+      this->allocatedPins[t] = pin;
+      break;
+    }
+  }
 
   return;
 }
 
-void fxPwm_DigitalWrite(UINT8 port, INT16 value){
-  if(port>=fxPwm_numPorts || fxPwm_ports==NULL){
+//Dado o ponteiro para uma porta, tenta removê-la.
+//A remoção e feita procurando o ponteiro na lista de portas.
+//Se encontrar, desloca todos elementos da frente para trás, e coloca NULL no último.
+//Se o ponteiro representar um item alocado internamente, este é desalocado.
+void fxPwm_T1::RemovePort(fxPwm_Port *port){
+  //Verificação de realidade.
+  if(this->IsAllocated()==FALSE || port==NULL){
     return;
   }
-	
-  //Garantir modo de saída.
-  *fxPwm_ports[port].DDR |= fxPwm_ports[port].mask;
-  if(value==LOW){
-	*fxPwm_ports[port].port &= ~fxPwm_ports[port].mask;
-  }else{
-	*fxPwm_ports[port].port |= fxPwm_ports[port].mask;
-  }
-  return;
-}
 
-INT16 fxPwm_DigitalRead(UINT8 port){
-  if(port>=fxPwm_numPorts || fxPwm_ports==NULL){
-    return LOW;
-  }
-  
-  return (*fxPwm_ports[port].port&fxPwm_ports[port].mask)?(HIGH):(LOW);
-}
+  fxPwm_SaveSREG();cli();
 
-//Funções que retornam parâmetros.
-
-inline FLOAT fxPwm_GetDuty(UINT8 port){
-  return (port>=fxPwm_numPorts || fxPwm_ports==NULL)?(0.0):(fxPwm_ports[port].duty);
-}
-
-inline TIME_US fxPwm_GetPeriod(UINT8 port){
-  return (port>=fxPwm_numPorts || fxPwm_ports==NULL)?(0):((TIME_US)fxPwm_ports[port].period);
-}
-
-inline FLOAT fxPwm_GetFrequency(UINT8 port){
-  return (port>=fxPwm_numPorts || fxPwm_ports==NULL)?(0.0):(fxPwm_ports[port].period);
-}
-
-//Recalcula os períodos de ciclo alto e baixo, e coloca a saída em nível BAIXO.
-//Não agenda de forma nenhuma o próximo evento.
-void fxPwm_ResetDuty(UINT8 port){
-  if(port>=fxPwm_numPorts || fxPwm_ports == NULL) return;
-
-  fxPwm_PortData *currentPort = &fxPwm_ports[port];
-
-  //Salvar contexto.
-  fxPwm_SAVE_SREG();
-  cli();
-  
-  //Calcula os períodos.
-  TIME_US highPeriod = (TIME_US)(((FLOAT)fxPwm_GetPeriod(port)*fxPwm_GetDuty(port)));
-  TIME_US lowPeriod = fxPwm_GetPeriod(port) - highPeriod;
-  
-  currentPort->halfPeriod1 = highPeriod;
-  currentPort->halfPeriod2 = lowPeriod;
-  fxPwm_DigitalWrite(port, LOW);
-
-  fxPwm_RESTORE_SREG();
-}
-
-//Atribui valor de período e ciclo de trabalho.
-//Se o período = 0, é desligado.
-void fxPwm_SetPeriodAndDuty(UINT8 port, TIME_US period, FLOAT duty){
-  if(port>=fxPwm_numPorts || fxPwm_ports == NULL) return;
-  
-  fxPwm_PortData *currentPort = &fxPwm_ports[port];
-  
-  duty = (duty<0.0)?(0.0):((duty>1.0)?(1.0):(duty));
-  
-  //Verifica se está efetivamente fazendo uma modificação nos valores chaves.
-  if(period==currentPort->period && currentPort->duty==duty){
-    return;
-  }
-  
-  //Calcula os períodos.
-  TIME_US highPeriod = (TIME_US)((FLOAT)period*duty);
-  TIME_US lowPeriod = period - highPeriod;
-  
-  TIME_US currentTime = fxPwm_MicrosCallback();
-  
-  //Salvar contexto.
-  fxPwm_SAVE_SREG();
-  cli();
-
-  /* A mudança de período não deve influenciar o ciclo atual.
-   * Para isso, a função olha para o ciclo de trabalho e para os meios períodos atuais para determinar se está com a porta positiva ou negativa.
-   * halfPeriod1 e halfPeriod2 ficam trocando de valores; inicialmente halfPeriod1 representa o tempo de nível ALTO.
-   * É preciso combinar os valores de nivel alto e baixo sem quebrar a sequência atual.
-   */
-   if(fxPwm_DigitalRead(port)==LOW){
-		currentPort->halfPeriod1 = highPeriod;
-		currentPort->halfPeriod2 = lowPeriod;
-   }else{
-		currentPort->halfPeriod2 = highPeriod;
-		currentPort->halfPeriod1 = lowPeriod;
-   }
-
-  //Guardar informações úteis.
-  currentPort->duty = duty;
-  currentPort->period = highPeriod+lowPeriod;
-  
-  if(currentPort->period==0){
-    //Não há período. Não agendar nada.
-    currentPort->nextEvent = (TIME_US)fxPwm_NO_NEXT_EVENT;
-    fxPwm_DigitalWrite(port, LOW);
-  }else{
-    if(highPeriod==0){
-      //Nível alto nulo, nível baixo constante.
-      currentPort->nextEvent = (TIME_US)fxPwm_NO_NEXT_EVENT;
-      fxPwm_DigitalWrite(port, LOW);
-    }else if(lowPeriod==0){
-      //Nível alto constante, nível baixo nulo.
-	  currentPort->nextEvent = (TIME_US)fxPwm_NO_NEXT_EVENT;
-      fxPwm_DigitalWrite(port, HIGH);
-	}else{
-      //Há ambos período alto e baixo.
-      //Verificar se a porta habilitada. Se estiver, agendar próximo evento.
-      if(currentPort->enabled == TRUE && period*2 + currentTime < currentPort->nextEvent){
-        currentPort->nextEvent = period*2 + currentTime;
-        t1c_SetNextFireMax(currentPort->nextEvent);
+  //Percorrer lista estática.
+  UINT8 t,u, portN;
+  for(t=0;t<this->maxPorts;t++){
+    if(this->ports[t]==NULL){
+      //Chegou no último. Terminar.
+      break;
+    }
+    if(this->ports[t]==port){
+      //Encontrou item certo. Deslocar todos depois dele para trás.
+      for(u=t;u<this->maxPorts-1;u++){
+        this->ports[u] = this->ports[u+1];
       }
+      //Colocar NULL no último e sair.
+      this->ports[this->maxPorts-1] = NULL;
+      break;
+    }
+  }
+
+  //Pesquisar se o número do pino está na lista de itens alocados internamente.
+  for(t=0;t<this->maxPorts;t++){
+    if(this->allocatedPins[t]==port->pinNumber){
+      //Porta foi alocada internamente. Desalocar e marcar.
+      free(port);
+      this->allocatedPins[t] = 0xFF;
+      break;
     }
   }
   
-  
-
-  fxPwm_RESTORE_SREG();
-}
-
-//Atribui o período usando a função fxPwm_SetPeriodAndDuty.
-void fxPwm_SetPeriod(UINT8 port, TIME_US period){
-  if(port>=fxPwm_numPorts || fxPwm_ports == NULL) return;
-  fxPwm_SetPeriodAndDuty(port, period,fxPwm_ports[port].duty);
-}
-
-//Atribui o ciclo de trabalho usando fxPwm_SetPeriodAndDuty.
-void fxPwm_SetDuty(UINT8 port, FLOAT duty){
-  if(port>=fxPwm_numPorts || fxPwm_ports == NULL) return;
-  fxPwm_SetPeriodAndDuty(port, fxPwm_ports[port].period,duty);
-}
-
-//Atribui a frequência (inverso do período) e o ciclo de trabalho usando fxPwm_SetPeriodAndDuty.
-void fxPwm_SetFrequencyAndDuty(UINT8 port, FLOAT frequency, FLOAT duty){
-  if(frequency<=0.0){
-    fxPwm_SetPeriodAndDuty(port, 0, duty);
-  }else{
-	fxPwm_SetPeriodAndDuty(port, (TIME_US)(1000000.0/frequency), duty);
-  }
-}
-
-//Atribui a frequência (inverso do período) usando fxPwm_SetPeriod.
-void fxPwm_SetFrequency(UINT8 port, FLOAT frequency){
-  if(frequency<=0.0){
-    fxPwm_SetPeriod(port, 0);
-  }else{
-	fxPwm_SetPeriod(port, (TIME_US)(1000000.0/frequency));
-  }
-}
-
-//Desativa (silencia) a porta.
-void fxPwm_Disable(UINT8 port){
-  if(port>=fxPwm_numPorts || fxPwm_ports  == NULL) return;
-  
-  fxPwm_PortData *currentPort = &fxPwm_ports[port];
-
-  //Não desativar se já estiver desativada.
-  if(currentPort->enabled == FALSE)
-    return;
-  
-  fxPwm_SAVE_SREG();
-  cli();
-
-  //Inibir o próximo evento e desativar.
-  currentPort->nextEvent = (TIME_US)fxPwm_NO_NEXT_EVENT;
-  currentPort->enabled = FALSE;
-
-  fxPwm_DigitalWrite(port, LOW);
-  
-  fxPwm_RESTORE_SREG();
-}
-
-void fxPwm_DisableAll(){
-  UINT8 t;
-  for(t=0;t<fxPwm_numPorts;t++){
-    fxPwm_Disable(t);
-  }
-}
-
-//Ativa a porta e permite soar.
-void fxPwm_Enable(UINT8 port){
-  if(port>=fxPwm_numPorts || fxPwm_ports  == NULL) return;
-  
-  fxPwm_PortData *currentPort = &fxPwm_ports[port];
-
-  //Não ativar se já estiver ativada.
-  if(currentPort->enabled != FALSE)
-    return;
-  
-  fxPwm_SAVE_SREG();
-  cli();
-
-  //Verificar se tem algo para ser tocado.
-  if(currentPort->period!=0){
-    //Permitir que esse algo toque. Habilitar disparo.
-    currentPort->nextEvent = fxPwm_MicrosCallback();
-    //Recalcular valores do ciclo de trabalho, para garantir que inicie pelo ciclo positivo.
-    fxPwm_ResetDuty(port);
-
-    //Verificar se a biblioteca foi inicializada, e já agendar a próxima chamada.
-    if(fxPwm_started!=FALSE){
-      t1c_SetNextFire(fxPwm_MicrosCallback());
-    }
-  }else{
-    //Habilitar mas não agendar coisa alguma.
-    currentPort->nextEvent = (TIME_US)fxPwm_NO_NEXT_EVENT;
-  }
-  currentPort->enabled = TRUE;
-
-  fxPwm_RESTORE_SREG();
-}
-
-void fxPwm_EnableAll(){
-  UINT8 t;
-  //Salvar contexto para impedir que o callback interrompa essa função até o fim.
-  fxPwm_SAVE_SREG();
-  cli();
-  for(t=0;t<fxPwm_numPorts;t++){
-    fxPwm_Enable(t);
-  }
-  fxPwm_RESTORE_SREG();
-}
-
-void fxPwm_Start(){
-  fxPwm_started = TRUE;
-  
-  t1c_SetNextFire(fxPwm_MicrosCallback());
-}
-
-void fxPwm_Stop(){
-  t1c_Stop();
-  fxPwm_started = FALSE;
-}
-
-//Limpa e libera tudo.
-void fxPwm_Free(){
-  fxPwm_DisableAll();
-  fxPwm_Stop();
-  fxPwm_ClearAllPorts();
-
-  if(fxPwm_numPorts==0 || fxPwm_ports  == NULL){
-    fxPwm_numPorts = 0;
-    fxPwm_ports = NULL;
-    return;
-  }
-
-  free(fxPwm_ports);
-  
-  fxPwm_numPorts = 0;
-  fxPwm_ports = NULL;
+  fxPwm_RestoreSREG();
   return;
+}
+
+//Remove a porta a partir de um número de pino.
+void fxPwm_T1::RemovePort(UINT8 pin){
+  this->RemovePort(this->GetPort(pin));
+ 
+  return;
+}
+
+
+//Atribui período a um dos pinos.
+void fxPwm_T1::SetPeriod(UINT8 pin, TIME_US period){
+  fxPwm_Port *port = this->GetPort(pin);
+
+  if(port!=NULL){
+    port->SetPeriod(period);
+  }
+  
+  return;
+}
+
+//Atribui frequência a um dos pinos.
+void fxPwm_T1::SetFrequency(UINT8 pin, FLOAT frequency){
+  fxPwm_Port *port = this->GetPort(pin);
+
+  if(port!=NULL){
+    port->SetFrequency(frequency);
+  }
+
+  return;
+}
+
+//Atribui ciclo de trabalho a um dos pinos.
+void fxPwm_T1::SetDuty(UINT8 pin, FLOAT duty){
+  fxPwm_Port *port = this->GetPort(pin);
+
+  if(port!=NULL){
+    port->SetDuty(duty);
+  }
+
+  return;
+}
+
+//Atribui o mapeamento na porta.
+void fxPwm_T1::SetMap(UINT8 pin, FLOAT dutyValue1, FLOAT mappedValue1, FLOAT dutyValue2, FLOAT mappedValue2){
+  fxPwm_Port *port = this->GetPort(pin);
+
+  if(port!=NULL){
+    port->SetMap(dutyValue1, mappedValue1, dutyValue2, mappedValue2);
+  }
+
+  return;
+}
+
+//Habilita modulação em um pino.
+void fxPwm_T1::EnablePin(UINT8 pin){
+  fxPwm_Port *port = this->GetPort(pin);
+
+  if(port!=NULL){
+    port->Enable();
+  }
+
+  return;
+}
+
+//Desabilita modulação em um pino.
+void fxPwm_T1::DisablePin(UINT8 pin){
+  fxPwm_Port *port = this->GetPort(pin);
+
+  if(port!=NULL){
+    port->Disable();
+  }
+
+  return;
+}
+
+//Habilita todos os pinos alocados.
+void fxPwm_T1::EnableAll(){
+  UINT8 t;
+  for(t=0;t<this->GetNumRegisteredPorts();t++){
+    this->EnablePin(this->ports[t]->pinNumber);
+  }
+
+  return;
+}
+
+void fxPwm_T1::DisableAll(){
+  UINT8 t;
+  for(t=0;t<this->GetNumRegisteredPorts();t++){
+    this->DisablePin(this->ports[t]->pinNumber);
+  }
+
+  return;
+}
+
+
+//===============================================================
+//Métodos de aquisição de informação.
+//===============================================================
+
+//Pesquisa pela porta com certo número de pino e retorna o ponteiro.
+//USE COM CUIDADO!!!
+fxPwm_Port *fxPwm_T1::GetPort(UINT8 pin){
+  if(this->ports==NULL || this->maxPorts==0 || pin==0xFF){
+    return NULL;
+  }
+
+  UINT8 t;
+  for(t=0;t<this->maxPorts;t++){
+    if(this->ports[t]==NULL){
+      break;
+    }
+    if(this->ports[t]->pinNumber == pin){
+      return this->ports[t];
+    }
+  }
+
+  return NULL;
+}
+
+//Retorna a quantidade máxima de portas alocáveis.
+UINT8 fxPwm_T1::GetMaxPorts(){
+  return this->maxPorts;
+}
+
+//Conta a quantidade de portas registradas.
+UINT8 fxPwm_T1::GetNumRegisteredPorts(){
+  if(this->IsAllocated()==FALSE || this->maxPorts==0xFF){
+    return 0;
+  }
+
+  UINT8 t;
+  for(t=0;t<this->maxPorts;t++){
+    if(this->ports[t]==NULL){
+      return t;
+    }
+  }
+
+  return t;
+}
+
+//Retorna um ponteiro para uma porta registrada a partir de um índice, ou NULL se não existir.
+fxPwm_Port *fxPwm_T1::GetRegisteredPort(UINT8 index){
+  if(this->IsAllocated()==FALSE || index>=this->maxPorts){
+    return NULL;
+  }
+  return this->ports[index];
+}
+
+//Retorna o número do pino de uma porta registrada a partir de um índice, ou 0xFF se não existir.
+UINT8 fxPwm_T1::GetRegisteredPortPinNumber(UINT8 index){
+  fxPwm_Port *port = GetRegisteredPort(index);
+  if(port!=NULL){
+    return port->pinNumber;
+  }
+  return 0xFF;
+}
+
+//Retorna o índice de um pino, ou 0xFF se não existir.
+UINT8 fxPwm_T1::GetIndex(UINT8 pin){
+  if(this->IsAllocated() || pin == 0xFF){
+    return 0xFF;
+  }
+
+  UINT8 t;
+  for(t=0;t<this->maxPorts;t++){
+    if(this->ports[t]==NULL){
+      break;
+    }
+    if(this->ports[t]->pinNumber == pin){
+      return t;
+    }
+  }
+
+  return 0xFF;
+}
+
+TIME_US fxPwm_T1::GetPeriod(UINT8 pin){
+  fxPwm_Port *port = GetPort(pin);
+  if(port!=NULL){
+    return port->GetPeriod();
+  }
+  return 0;
+}
+
+FLOAT fxPwm_T1::GetFrequency(UINT8 pin){
+  fxPwm_Port *port = GetPort(pin);
+  if(port!=NULL){
+    return port->GetFrequency();
+  }
+  return 0.0;
+}
+
+FLOAT fxPwm_T1::GetDuty(UINT8 pin){
+  fxPwm_Port *port = GetPort(pin);
+  if(port!=NULL){
+    return port->GetDuty();
+  }
+  return 0.0;
+}
+
+TIME_US fxPwm_T1::GetNextEvent(UINT8 pin){
+  fxPwm_Port *port = GetPort(pin);
+  if(port!=NULL){
+    return (TIME_US)(((UINT64)port->next*(UINT64)nsPerTimerClock)/(UINT64)1000);
+  }
+  return 0;
+}
+
+  
+TIME_US fxPwm_T1::Micros(){
+  return (TIME_US)(((UINT64)this->clockCount*(UINT64)nsPerTimerClock)/(UINT64)1000);
 }
 
 

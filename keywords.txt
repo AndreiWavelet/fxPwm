@@ -1,0 +1,10 @@
+#####################################
+# Syntax Coloring Map For fxPwm
+#####################################
+#####################################
+# Class KEYWORD1
+#####################################
+
+fxPwm_T1	KEYWORD1
+fxPwm		KEYWORD1
+fxPwm_Port 	KEYWORD2

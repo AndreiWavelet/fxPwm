@@ -8,33 +8,34 @@
 
 #include <fxPwm.h>
 
-//Current brigthness, from 0.0 to 1.0.
-float brightness = 0.0;
-
 //Frequency of the brightness, Hz.
 float frequency=1.0;
 
 void setup() {
-  //Initialize fxPwm library with one output.
-  fxPwm_Initialize(1,NULL);
+  //Initialize fxPwm library.
+  fxPwm.Initialize();
+  fxPwm.Start();
+  
+  //Register the LED_BUILTIN pin.
+  fxPwm.RegisterPort(LED_BUILTIN);
 
-  //Configures the port index 0 with the LED_BUILTIN pin.
-  fxPwm_ConfigurePort(0, LED_BUILTIN);
+  //Sets the initial PWM frequency.
+  fxPwm.SetFrequency(LED_BUILTIN, 300.0);
 
-  //Sets the initial PWM frequency (1000.0 Hz) with standart duty cycle.
-  fxPwm_SetFrequency(0, 1000.0);
-
-  //Starts the library.
-  fxPwm_Start();
-
-  //Enable port index 0.
-  fxPwm_Enable(0);
+  //Maps the duty cycle to go from -1.0 at 0% to +1.0 at 100%, the standard sine function range.
+  fxPwm.SetMap(LED_BUILTIN, 0.0, -1.0, 1.0, 1.0);
+  
+  //Enable LED_BUILTIN pin.
+  fxPwm.EnablePin(LED_BUILTIN);
 }
 
 
 void loop() {
+  //Get current time.
+  float t = ((float)fxPwm.Micros()/1000000.0);
   //Calculate current brightness from a sine function.
-  brightness=sin(6.283*frequency*((float)micros()/1000000.0))*0.5+0.5;
+  float brightness=sin(6.28*frequency*t);
   //Se duty cycle to change brightness.
-  fxPwm_SetDuty(0, brightness);
+  fxPwm.SetDuty(LED_BUILTIN, brightness);
+  //Go on forever.
 }
