@@ -141,16 +141,16 @@ void fxPwm_T1::ConfigureTimer(){
   //ICR1: não usado.
   ICR1 = 0;
 
-  //OCR1A: comparado constantemente com TCNT1 para disparar interrupção.
+  //OCR1A: comparado constantemente com TCNT1 para disparar interrupção. Não usado.
   OCR1A = 0;
 
-  //OCR1B: o mesmo que OCR1A. Não usado.
+  //OCR1B: o mesmo que OCR1A, mas usado.
   OCR1B = 0;
 
   //TIMSK1: 
-  //Habilitar OCIEA:  0bxxxxxx1x (interrupção quando OCR1A=TCNT1)
-  //Limpar ICIE, OCIEB E TOIE: 0bxx0xx0x0
-  TIMSK1 = fxPwm_CLEAR_BITS(TIMSK1, 0b00100111);
+  //Habilitar OCIEB:  0bxxxxx1xx (interrupção quando OCR1B=TCNT1)
+  //Limpar ICIE, OCIEA E TOIE: 0bxx0xxx00
+  TIMSK1 = fxPwm_CLEAR_BITS(TIMSK1, 0b00100011);
   TIMSK1 = fxPwm_SET_BITS(TIMSK1, 0b00000100);
 
   //TIFR1: flags de interrupção. Limpar todas: 0bxx0xx000
