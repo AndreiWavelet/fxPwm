@@ -10,12 +10,12 @@
  *  -----------------------------------------------------------
  *  17-07-2018: primeira documentação
  *  21-07-2018: modificações maiores na estrutura da biblioteca. Melhoria de desempenho.
+ *  25-07-2018: substituição de malloc() por new[] e de free() por delete[]. Destrutor.
  */
 
 #include <fxPwmTypes.h>
 #include <fxPwm.h>
 #include <fxPwm_Port.h>
-#include <stdlib.h>
 #include <avr/interrupt.h>
 #include "arduino.h"
 
@@ -210,7 +210,14 @@ void fxPwm_T1::SetNextFireMin(TIME_CLOCK clockCount){
 
 //Limpar na instância.
 fxPwm_T1::fxPwm_T1(){
-  Cleanup();
+  this->Cleanup();
+
+  return;
+}
+
+fxPwm_T1::~fxPwm_T1(){
+  this->Free();
+  this->Cleanup();
 
   return;
 }
@@ -325,7 +332,8 @@ void fxPwm_T1::Initialize(UINT8 maxPorts){
   }
 
   //Tentar alocar lista de portas.
-  ports = (fxPwm_Port**)malloc(sizeof(fxPwm_Port*)*(maxPorts+1));
+  ports = new fxPwm_Port*[maxPorts+1];
+  //Verificar se funcionou, como se std::nothrow estive habilitado.
   if(ports==NULL){
     //Falhou.
     fxPwm_RestoreSREG();
@@ -333,9 +341,9 @@ void fxPwm_T1::Initialize(UINT8 maxPorts){
   }
 
   //Tentar alocar lista de pinos.
-  allocatedPins = (UINT8*)malloc(sizeof(UINT8)*(maxPorts));
+  allocatedPins = new UINT8[maxPorts];
   if(allocatedPins==NULL){
-    free(ports);
+    delete[] ports;
     fxPwm_RestoreSREG();
     return;
   }
@@ -379,8 +387,8 @@ void fxPwm_T1::Free(){
   }
 
   //Liberar memórias.
-  free(ports);
-  free(allocatedPins);
+  delete[] ports;
+  delete[] allocatedPins;
 
   //Limpeza.
   Cleanup();
@@ -478,14 +486,13 @@ void fxPwm_T1::RegisterPort(UINT8 pin){
   }
 
   //Tentar alocar memória para a porta.
-  fxPwm_Port *newPort = (fxPwm_Port*)malloc(sizeof(fxPwm_Port));
+  fxPwm_Port *newPort = new fxPwm_Port;
   if(newPort==NULL){
     //Falha ao alocar.
     return;
   }
 
   //Realizar limpeza da memória da porta e atribuir pino.
-  newPort->Cleanup();
   newPort->SetPinNumber(pin);
 
   //Registrar porta.
@@ -536,7 +543,7 @@ void fxPwm_T1::RemovePort(fxPwm_Port *port){
   for(t=0;t<this->maxPorts;t++){
     if(this->allocatedPins[t]==port->pinNumber){
       //Porta foi alocada internamente. Desalocar e marcar.
-      free(port);
+      delete port;
       this->allocatedPins[t] = 0xFF;
       break;
     }

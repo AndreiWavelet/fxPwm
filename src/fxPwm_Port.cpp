@@ -8,6 +8,7 @@
  *  porém NÃO HÁ GARANTIA para qualquer propósito.
  *  -----------------------------------------------------------
  *  21-07-2018: primeira documentação.
+ *	25-07-2018: destrutor.
  */
 
 #include <fxPwmTypes.h>
@@ -101,6 +102,14 @@ fxPwm_Port::fxPwm_Port(){
 fxPwm_Port::fxPwm_Port(UINT8 pinNumber){
   this->Cleanup();
   this->SetPinNumber(pinNumber);
+
+  return;
+}
+
+//Destrutir para garantir suavidade.
+fxPwm_Port::~fxPwm_Port(){
+  this->Disable();
+  this->Cleanup();
 
   return;
 }

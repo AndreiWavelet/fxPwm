@@ -10,6 +10,7 @@
  *  -----------------------------------------------------------
  *  17-07-2018: primeira documentação
  *  21-07-2018: modificações maiores na estrutura da biblioteca. Melhoria de desempenho.
+ *  25-07-2018: destrutor
  *  -----------------------------------------------------------
  *  Problemas conhecidos:
  *  22-07-2018: o uso da comunicação Serial pode quebrar a biblioteca.
@@ -124,6 +125,7 @@ public:
   friend class fxPwm_Port;
   
   fxPwm_T1();
+  ~fxPwm_T1();
 
   //Resolve tudo que der nas saídas.
   void Tick();

@@ -9,6 +9,7 @@
  *  porém NÃO HÁ GARANTIA para qualquer propósito.
  *  -----------------------------------------------------------
  *  21-07-2018: primeira documentação.
+ *  25-07-2018: destrutor.
  */
 
 #ifndef fxPwm_Port_H
@@ -69,6 +70,9 @@ public:
   //Inicializa a porta com ou sem um pino.
   fxPwm_Port();
   fxPwm_Port(UINT8 pinNumber);
+
+  //Destrutor.
+  ~fxPwm_Port();
 
   //Retorna o período configurado.
   TIME_US GetPeriod();
